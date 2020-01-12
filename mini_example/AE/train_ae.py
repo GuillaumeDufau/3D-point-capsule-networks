@@ -10,7 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(BASE_DIR, '../../models')))
 sys.path.append(os.path.abspath(os.path.join(BASE_DIR, '../../dataloaders')))
 
 import shapenet_part_loader
-from pointcapsnet_ae import PointCapsNet
+from em_pointcapsnet_ae import PointCapsNet
 
 def main():
     USE_CUDA = True
@@ -72,7 +72,7 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=8, help='input batch size')
-    parser.add_argument('--n_epochs', type=int, default=300, help='number of epochs to train for')
+    parser.add_argument('--n_epochs', type=int, default=3, help='number of epochs to train for')
 
     parser.add_argument('--prim_caps_size', type=int, default=1024, help='number of primary point caps')
     parser.add_argument('--prim_vec_size', type=int, default=16, help='scale of primary point caps')
