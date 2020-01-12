@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-
-
-
 """
-@author: Chris Murray
+Created on Thu Sep  6 17:57:49 2018
+
+@author: zhao
 """
 
 from __future__ import print_function
@@ -18,6 +16,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 from collections import OrderedDict
 import sys
+import math
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 #sys.path.append(os.path.join(BASE_DIR, 'nndistance'))
@@ -43,217 +42,298 @@ class ConvLayer(nn.Module):
 
 
 class PrimaryPointCapsLayer(nn.Module):
-    def __init__(self, prim_vec_size=8, num_points=2048,B = 1024):
-        self.prim_vec_size = prim_vec_size
-        self.B = B
+    def __init__(self, prim_vec_size=8, num_points=2048):
         super(PrimaryPointCapsLayer, self).__init__()
         self.capsules = nn.ModuleList([
             torch.nn.Sequential(OrderedDict([
-                ('conv3', torch.nn.Conv1d(128, prim_vec_size, 1)),
-                ('bn3', nn.BatchNorm1d(prim_vec_size)),
+                ('conv3', torch.nn.Conv1d(128, 1024, 1)),
+                ('bn3', nn.BatchNorm1d(1024)),
                 ('mp1', torch.nn.MaxPool1d(num_points)),
             ]))
-            for _ in range(B)])
+            for _ in range(prim_vec_size + 1)])
 
-        self.activations = nn.ModuleList([
-            torch.nn.Sequential(OrderedDict([
-                ('conv3', torch.nn.Conv1d(128, 1, 1)),
-                ('bn3', nn.BatchNorm1d(1024)),
-            ]))
-            for _ in range(B)])
+    def forward(self, x):
+        u = [capsule(x) for capsule in self.capsules]
+        u = torch.stack(u, dim=2)
+        print(u.shape)
+        return u.view(u.shape[0],1,1,u.shape[1]*(4*4+1))
 
-    def forward(self, x): #b,14,14,32
-        poses = [self.capsules[i](x) for i in range(self.B)]#(b,16,12,12) *32
-        poses = torch.cat(poses, dim=1) #b,16*32,12,12
-        activations = [self.activations[i](x) for i in range(self.B)] #(b,1,12,12)*32
-        activations = F.sigmoid(torch.cat(activations, dim=1)) #b,32,12,12
-        output = torch.cat([poses, activations], dim=1)
-        return output
+class ConvCaps(nn.Module):
+    r"""Create a convolutional capsule layer
+    that transfer capsule layer L to capsule layer L+1
+    by EM routing.
 
-"""
-    Primary Capsule layer is nothing more than concatenate several convolutional
-    layer together.
     Args:
-        A:input channel
-        B:number of types of capsules.
+        B: input number of types of capsules
+        C: output number on types of capsules
+        K: kernel size of convolution
+        P: size of pose matrix is P*P
+        stride: stride of convolution
+        iters: number of EM iterations
+        coor_add: use scaled coordinate addition or not
+        w_shared: share transformation matrix across w*h.
 
-    def __init__(self,A=32, B=32):
-        super(PrimaryCaps, self).__init__()
+    Shape:
+        input:  (*, h,  w, B*(P*P+1))
+        output: (*, h', w', C*(P*P+1))
+        h', w' is computed the same way as convolution layer
+        parameter size is: K*K*B*C*P*P + B*P*P
+    """
+    def __init__(self, B=1024, C=64, K=1, P=4, stride=1, iters=3,
+                 coor_add=False, w_shared=False):
+        super(ConvCaps, self).__init__()
+        # TODO: lambda scheduler
+        # Note that .contiguous() for 3+ dimensional tensors is very slow
         self.B = B
-        self.capsules_pose = nn.ModuleList([nn.Conv2d(in_channels=A,out_channels=4*4,
-                                                 kernel_size=1,stride=1)
-                                                 for i in range(self.B)])
-        self.capsules_activation = nn.ModuleList([nn.Conv2d(in_channels=A,out_channels=1,
-                                                 kernel_size=1,stride=1) for i
-                                                 in range(self.B)])
+        self.C = C
+        self.K = K
+        self.P = P
+        self.psize = P*P
+        self.stride = stride
+        self.iters = iters
+        self.coor_add = coor_add
+        self.w_shared = w_shared
+        # constant
+        self.eps = 1e-8
+        self._lambda = 1e-03
+        self.ln_2pi = torch.cuda.FloatTensor(1).fill_(math.log(2*math.pi))
+        # params
+        # Note that \beta_u and \beta_a are per capsule type,
+        # which are stated at https://openreview.net/forum?id=HJWLfGWRb&noteId=rJUY2VdbM
+        self.beta_u = nn.Parameter(torch.zeros(C))
+        self.beta_a = nn.Parameter(torch.zeros(C))
+        # Note that the total number of trainable parameters between
+        # two convolutional capsule layer types is 4*4*k*k
+        # and for the whole layer is 4*4*k*k*B*C,
+        # which are stated at https://openreview.net/forum?id=HJWLfGWRb&noteId=r17t2UIgf
+        self.weights = nn.Parameter(torch.randn(1, K*K*B, C, P, P))
+        # op
+        self.sigmoid = nn.Sigmoid()
+        self.softmax = nn.Softmax(dim=2)
 
-    def forward(self, x): #b,14,14,32
-        poses = [self.capsules_pose[i](x) for i in range(self.B)]#(b,16,12,12) *32
-        poses = torch.cat(poses, dim=1) #b,16*32,12,12
-        activations = [self.capsules_activation[i](x) for i in range(self.B)] #(b,1,12,12)*32
-        activations = F.sigmoid(torch.cat(activations, dim=1)) #b,32,12,12
-        output = torch.cat([poses, activations], dim=1)
-        return output
-"""
-# Implementation of the Latent Capsule Layer using EM routing instead of Routing by Agreement
-# Only have a single layer here
+    def m_step(self, a_in, r, v, eps, b, B, C, psize):
+        """
+            \mu^h_j = \dfrac{\sum_i r_{ij} V^h_{ij}}{\sum_i r_{ij}}
+            (\sigma^h_j)^2 = \dfrac{\sum_i r_{ij} (V^h_{ij} - mu^h_j)^2}{\sum_i r_{ij}}
+            cost_h = (\beta_u + log \sigma^h_j) * \sum_i r_{ij}
+            a_j = logistic(\lambda * (\beta_a - \sum_h cost_h))
+
+            Input:
+                a_in:      (b, C, 1)
+                r:         (b, B, C, 1)
+                v:         (b, B, C, P*P)
+            Local:
+                cost_h:    (b, C, P*P)
+                r_sum:     (b, C, 1)
+            Output:
+                a_out:     (b, C, 1)
+                mu:        (b, 1, C, P*P)
+                sigma_sq:  (b, 1, C, P*P)
+        """
+        r = r * a_in
+        r = r / (r.sum(dim=2, keepdim=True) + eps)
+        r_sum = r.sum(dim=1, keepdim=True)
+        coeff = r / (r_sum + eps)
+        coeff = coeff.view(b, B, C, 1)
+
+        mu = torch.sum(coeff * v, dim=1, keepdim=True)
+        sigma_sq = torch.sum(coeff * (v - mu)**2, dim=1, keepdim=True) + eps
+
+        r_sum = r_sum.view(b, C, 1)
+        sigma_sq = sigma_sq.view(b, C, psize)
+        cost_h = (self.beta_u.view(C, 1) + torch.log(sigma_sq.sqrt())) * r_sum
+
+        a_out = self.sigmoid(self._lambda*(self.beta_a - cost_h.sum(dim=2)))
+        sigma_sq = sigma_sq.view(b, 1, C, psize)
+
+        return a_out, mu, sigma_sq
+
+    def e_step(self, mu, sigma_sq, a_out, v, eps, b, C):
+        """
+            ln_p_j = sum_h \dfrac{(\V^h_{ij} - \mu^h_j)^2}{2 \sigma^h_j}
+                    - sum_h ln(\sigma^h_j) - 0.5*\sum_h ln(2*\pi)
+            r = softmax(ln(a_j*p_j))
+              = softmax(ln(a_j) + ln(p_j))
+
+            Input:
+                mu:        (b, 1, C, P*P)
+                sigma:     (b, 1, C, P*P)
+                a_out:     (b, C, 1)
+                v:         (b, B, C, P*P)
+            Local:
+                ln_p_j_h:  (b, B, C, P*P)
+                ln_ap:     (b, B, C, 1)
+            Output:
+                r:         (b, B, C, 1)
+        """
+        ln_p_j_h = -1. * (v - mu)**2 / (2 * sigma_sq) \
+                    - torch.log(sigma_sq.sqrt()) \
+                    - 0.5*self.ln_2pi
+
+        ln_ap = ln_p_j_h.sum(dim=3) + torch.log(a_out.view(b, 1, C))
+        r = self.softmax(ln_ap)
+        return r
+
+    def caps_em_routing(self, v, a_in, C, eps):
+        """
+            Input:
+                v:         (b, B, C, P*P)
+                a_in:      (b, C, 1)
+            Output:
+                mu:        (b, 1, C, P*P)
+                a_out:     (b, C, 1)
+
+            Note that some dimensions are merged
+            for computation convenient, that is
+            `b == batch_size*oh*ow`,
+            `B == self.K*self.K*self.B`,
+            `psize == self.P*self.P`
+        """
+        b, B, c, psize = v.shape
+        assert c == C
+        assert (b, B, 1) == a_in.shape
+
+        r = torch.cuda.FloatTensor(b, B, C).fill_(1./C)
+        for iter_ in range(self.iters):
+            a_out, mu, sigma_sq = self.m_step(a_in, r, v, eps, b, B, C, psize)
+            if iter_ < self.iters - 1:
+                r = self.e_step(mu, sigma_sq, a_out, v, eps, b, C)
+
+        return mu, a_out
+
+    def add_pathes(self, x, B, K, psize, stride):
+        """
+            Shape:
+                Input:     (b, H, W, B*(P*P+1))
+                Output:    (b, H', W', K, K, B*(P*P+1))
+        """
+        b, h, w, c = x.shape
+        print(self.B)
+        print(psize)
+        print(B*(psize+1))
+        assert h == w
+        assert c == B*(psize+1)
+        oh = ow = int(((h - K )/stride)+ 1) # moein - changed from: oh = ow = int((h - K + 1) / stride)
+        idxs = [[(h_idx + k_idx) \
+                for k_idx in range(0, K)] \
+                for h_idx in range(0, h - K + 1, stride)]
+        x = x[:, idxs, :, :]
+        x = x[:, :, :, idxs, :]
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        return x, oh, ow
+
+    def transform_view(self, x, w, C, P, w_shared=False):
+        """
+            For conv_caps:
+                Input:     (b*H*W, K*K*B, P*P)
+                Output:    (b*H*W, K*K*B, C, P*P)
+            For class_caps:
+                Input:     (b, H*W*B, P*P)
+                Output:    (b, H*W*B, C, P*P)
+        """
+        b, B, psize = x.shape
+        assert psize == P*P
+
+        x = x.view(b, B, 1, P, P)
+        if w_shared:
+            hw = int(B / w.size(1))
+            w = w.repeat(1, hw, 1, 1, 1)
+
+        w = w.repeat(b, 1, 1, 1, 1)
+        x = x.repeat(1, 1, C, 1, 1)
+        v = torch.matmul(x, w)
+        v = v.view(b, B, C, P*P)
+        return v
+
+    def add_coord(self, v, b, h, w, B, C, psize):
+        """
+            Shape:
+                Input:     (b, H*W*B, C, P*P)
+                Output:    (b, H*W*B, C, P*P)
+        """
+        assert h == w
+        v = v.view(b, h, w, B, C, psize)
+        coor = torch.arange(h, dtype=torch.float32) / h
+        coor_h = torch.cuda.FloatTensor(1, h, 1, 1, 1, self.psize).fill_(0.)
+        coor_w = torch.cuda.FloatTensor(1, 1, w, 1, 1, self.psize).fill_(0.)
+        coor_h[0, :, 0, 0, 0, 0] = coor
+        coor_w[0, 0, :, 0, 0, 1] = coor
+        v = v + coor_h + coor_w
+        v = v.view(b, h*w*B, C, psize)
+        return v
+
+    def forward(self, x):
+        print(x.shape)
+        print(self.B)
+        b, h, w, c = x.shape
+        if not self.w_shared:
+            # add patches
+            x, oh, ow = self.add_pathes(x, 1024, 1, 16, self.stride)
+
+            # transform view
+            p_in = x[:, :, :, :, :, :self.B*self.psize].contiguous()
+            a_in = x[:, :, :, :, :, self.B*self.psize:].contiguous()
+            p_in = p_in.view(b*oh*ow, self.K*self.K*self.B, self.psize)
+            a_in = a_in.view(b*oh*ow, self.K*self.K*self.B, 1)
+            v = self.transform_view(p_in, self.weights, self.C, self.P)
+
+            # em_routing
+            p_out, a_out = self.caps_em_routing(v, a_in, self.C, self.eps)
+            p_out = p_out.view(b, oh, ow, self.C*self.psize)
+            a_out = a_out.view(b, oh, ow, self.C)
+            out = torch.cat([p_out, a_out], dim=3)
+        else:
+            assert c == self.B*(self.psize+1)
+            assert 1 == self.K
+            assert 1 == self.stride
+            p_in = x[:, :, :, :self.B*self.psize].contiguous()
+            p_in = p_in.view(b, h*w*self.B, self.psize)
+            a_in = x[:, :, :, self.B*self.psize:].contiguous()
+            a_in = a_in.view(b, h*w*self.B, 1)
+
+            # transform view
+            v = self.transform_view(p_in, self.weights, self.C, self.P, self.w_shared)
+
+            # coor_add
+            if self.coor_add:
+                v = self.add_coord(v, b, h, w, self.B, self.C, self.psize)
+
+            # em_routing
+            _, out = self.caps_em_routing(v, a_in, self.C, self.eps)
+
+        return out
+
+
+# Old
+'''
 class LatentCapsLayer(nn.Module):
-    def __init__(self, latent_caps_size=16, prim_caps_size=1024, prim_vec_size=16, latent_vec_size=64,num_iterations=1):
-        super(EM_LatentCapsLayer, self).__init__()
-        self.p_vec_size = prim_vec_size
-        self.l_vec_size = latent_vec_size
-        self.B = prim_caps_size
-        self.C = latent_caps_size
-
-        #specific to EM routing
-        self.beta_v = nn.Parameter(torch.randn(1))
-        self.beta_a = nn.Parameter(torch.randn(laten_caps_size))
-        self.K = 0
-        self.coordinate_add = coordinate_add
-        self.transform_share = True
-        self.stride = 1
-
+    def __init__(self, latent_caps_size=16, prim_caps_size=1024, prim_vec_size=16, latent_vec_size=64):
+        super(LatentCapsLayer, self).__init__()
+        self.prim_vec_size = prim_vec_size
+        self.prim_caps_size = prim_caps_size
+        self.latent_caps_size = latent_caps_size
         self.W = nn.Parameter(0.01*torch.randn(latent_caps_size, prim_caps_size, latent_vec_size, prim_vec_size))
-        self.num_iterations = num_iterations
 
-    def forward(self, x, lambda_,):
-#        t = time()
-        b = x.size(0) #batchsize
-        width_in = x.size(2)  #12
-        use_cuda = next(self.parameters()).is_cuda
-        #pose = x[:,:-self.B,:,:].contiguous() #b,16*32,12,12
-        pose = x[:,:-self.B,:,:].contiguous() #b,B*pvec
+    def forward(self, x):
+        u_hat = torch.squeeze(torch.matmul(self.W, x[:, None, :, :, None]), dim=-1)
+        u_hat_detached = u_hat.detach()
+        b_ij = Variable(torch.zeros(x.size(0), self.latent_caps_size, self.prim_caps_size)).cuda()
+        num_iterations = 3
+        for iteration in range(num_iterations):
+            c_ij = F.softmax(b_ij, 1)
+            if iteration == num_iterations - 1:
+                v_j = self.squash(torch.sum(c_ij[:, :, :, None] * u_hat, dim=-2, keepdim=True))
+            else:
+                v_j = self.squash(torch.sum(c_ij[:, :, :, None] * u_hat_detached, dim=-2, keepdim=True))
+                b_ij = b_ij + torch.sum(v_j * u_hat_detached, dim=-1)
+        return v_j.squeeze(-2)
 
-        #pose = pose.view(b,16,self.B,width_in,width_in).permute(0,2,3,4,1).contiguous() #b,B,12,12,16
-
-        pose = pose.view(b,self.B,self.prim_vec_size) #b,B,pvec
-        #activation = x[:,-self.B:,:,:] #b,B,12,12
-        activation = x[:,-self.B] #b,B
-
-        ## We're fully convolutional now
-
-        #w = width_out = int((width_in-self.K)/self.stride+1) if self.K else 1 #5
-        #if self.transform_share:
-        #    if self.K == 0:
-        #        self.K = width_in # class Capsules' kernel = width_in
-        #    W = self.W.view(self.B,1,1,self.C,self.p_vec_size,l_vec_size).expand(self.B,self.K,self.K,self.C,p_vec_size,l_vec_size).contiguous()
-        #else:
-        W = self.W #B,C,lvec,pvec
-
-        #used to store every capsule i's poses in each capsule c's receptive field
-        #poses = torch.stack([pose[:,:,self.stride*i:self.stride*i+self.K,:] for i in range(w)], dim=-1) #b,B,K,w*w,16
-
-        #poses = torch.stack([pose[:,:,self.stride*i:self.stride*i+self.K,:] for i in range(w)], dim=-1) #b,B,K,w*w,16
-
-
-        poses = pose.view(b,self.B,1,self.p_vec_size) #b,B,1,1,pvec
-        W_hat = W[None,:,:,:,:]                #1,B,C,lvec,pvec
-        votes = torch.matmul(W_hat, poses) #b,B,C,lvec
-
-        #Coordinate Addition
-        add = [] #K,K,w,w
-        #if self.coordinate_add:
-        #    for i in range(self.K):
-        #        for j in range(self.K):
-        #            for x in range(w):
-        #                for y in range(w):
-        #                    #compute where is the V_ic
-        #                    pos_x = self.stride*x + i
-        #                    pos_y = self.stride*y + j
-        #                    add.append([pos_x/width_in, pos_y/width_in])
-        #    add = Variable(torch.Tensor(add)).view(1,1,self.K,self.K,1,w,w,2)
-        #    add = add.expand(b,self.B,self.K,self.K,self.C,w,w,2).contiguous()
-        #    if use_cuda:
-        #        add = add.cuda()
-        #    votes[:,:,:,:,:,:,:,0,:2] = votes[:,:,:,:,:,:,:,0,:2] + add
-
-#        print(time()-t)
-        #Start EM
-        Cww = w*w*self.C
-        Bkk = self.K*self.K*self.B
-        R = np.ones([b,self.B,width_in,width_in,self.C,w,w])/Cww
-        V_s = votes.view(b,Bkk,Cww,l_vec_size) #b,Bkk,Cww,16
-        for iterate in range(self.iteration):
-#            t = time()
-            #M-step
-            r_s,a_s = [],[]
-            for typ in range(self.C):
-                for i in range(width_out):
-                    for j in range(width_out):
-                        r = R[:,:,self.stride*i:self.stride*i+self.K,  #b,B,K,K
-                                self.stride*j:self.stride*j+self.K,typ,i,j]
-                        r = Variable(torch.from_numpy(r).float())
-                        if use_cuda:
-                            r = r.cuda()
-                        r_s.append(r)
-                        a = activation[:,:,self.stride*i:self.stride*i+self.K,
-                                self.stride*j:self.stride*j+self.K] #b,B,K,K
-                        a_s.append(a)
-
-
-            r_s = torch.stack(r_s,-1).view(b, Bkk, Cww) #b,Bkk,Cww
-            a_s = torch.stack(a_s,-1).view(b, Bkk, Cww) #b,Bkk,Cww
-            r_hat = r_s*a_s #b,Bkk,Cww
-            r_hat = r_hat.clamp(0.01) #prevent nan since we'll devide sth. by r_hat
-            sum_r_hat = r_hat.sum(1).view(b,1,Cww,1).expand(b,1,Cww,l_vec_size) #b,Cww,16
-            r_hat_stack = r_hat.view(b,Bkk,Cww,1).expand(b, Bkk, Cww,l_vec_size) #b,Bkk,Cww,16
-            mu = torch.sum(r_hat_stack*V_s, 1, True)/sum_r_hat #b,1,Cww,16
-            mu_stack = mu.expand(b,Bkk,Cww,16) #b,Bkk,Cww,16
-            sigma = torch.sum(r_hat_stack*(V_s-mu_stack)**2,1,True)/sum_r_hat #b,1,Cww,16
-            sigma = sigma.clamp(0.01) #prevent nan since the following is a log(sigma)
-            cost = (self.beta_v + torch.log(sigma)) * sum_r_hat #b,1,Cww,16
-            beta_a_stack = self.beta_a.view(1,self.C,1).expand(b,self.C,w*w).contiguous().view(b,1,Cww)#b,Cww
-            a_c = torch.sigmoid(lambda_*(beta_a_stack-torch.sum(cost,3))) #b,1,Cww
-            mus = mu.view(b,self.C,w,w,l_vec_size) #b,C,w,w,16
-            sigmas = sigma.view(b,self.C,w,w,l_vec_size) #b,C,w,w,16
-            activations = a_c.view(b,self.C,w,w) #b,C,w,w
-#            print(time()-t)
-#            t = time(
-
-            #E-step
-            for i in range(width_in):
-                #compute the x axis range of capsules c that i connect to.
-                x_range = (max(floor((i-self.K)/self.stride)+1,0),min(i//self.stride+1,width_out))
-                #without padding, some capsules i may not be convolutional layer catched, in mnist case, i or j == 11
-                u = len(range(*x_range))
-                if not u:
-                    continue
-                for j in range(width_in):
-                    y_range = (max(floor((j-self.K)/self.stride)+1,0),min(j//self.stride+1,width_out))
-
-                    v = len(range(*y_range))
-                    if not v:
-                        continue
-                    mu = mus[:,:,x_range[0]:x_range[1],y_range[0]:y_range[1],:].contiguous() #b,C,u,v,16
-                    sigma = sigmas[:,:,x_range[0]:x_range[1],y_range[0]:y_range[1],:].contiguous() #b,C,u,v,16
-                    mu = mu.view(b,1,self.C,u,v,l_vec_size).expand(b,self.B,self.C,u,v,l_vec_size).contiguous()#b,B,C,u,v,16
-                    sigma = sigma.view(b,1,self.C,u,v,l_vec_size).expand(b,self.B,self.C,u,v,l_vec_size).contiguous()#b,B,C,u,v,16
-                    V = []; a = []
-                    for x in range(*x_range):
-                        for y in range(*y_range):
-                            #compute where is the V_ic
-                            pos_x = self.stride*x - i
-                            pos_y = self.stride*y - j
-                            V.append(votes[:,:,pos_x,pos_y,:,x,y,:,:]) #b,B,C,4,4
-                            a.append(activations[:,:,x,y].contiguous().view(b,1,self.C).expand(b,self.B,self.C).contiguous()) #b,B,C
-                    V = torch.stack(V,dim=3).view(b,self.B,self.C,u,v,l_vec_size) #b,B,C,u,v,16
-                    a = torch.stack(a,dim=3).view(b,self.B,self.C,u,v) #b,B,C,u,v
-                    p = torch.exp(-(V-mu)**2)/torch.sqrt(2*pi*sigma) #b,B,C,u,v,16
-                    p = p.prod(dim=5)#b,B,C,u,v
-                    p_hat = a*p  #b,B,C,u,v
-                    sum_p_hat = p_hat.sum(4).sum(3).sum(2) #b,B
-                    sum_p_hat = sum_p_hat.view(b,self.B,1,1,1).expand(b,self.B,self.C,u,v)
-                    r = (p_hat/sum_p_hat) #b,B,C,u,v --> R: b,B,12,12,32,5,5
-
-                    if use_cuda:
-                        r = r.cpu()
-                    R[:,:,i,j,:,x_range[0]:x_range[1],        #b,B,u,v,C
-                      y_range[0]:y_range[1]] = r.data.numpy()
-#            print(time()-t)
-
-        mus = mus.permute(0,4,1,2,3).contiguous().view(b,self.C*l_vec_size,w,w)#b,16*C,5,5
-        output = torch.cat([mus,activations], 1) #b,C*16,5,5
-        return output
+    def squash(self, input_tensor):
+        squared_norm = (input_tensor ** 2).sum(-1, keepdim=True)
+        output_tensor = squared_norm * input_tensor / \
+            ((1. + squared_norm) * torch.sqrt(squared_norm))
+        return output_tensor
+'''
 
 class PointGenCon(nn.Module):
     def __init__(self, bottleneck_size=2500):
@@ -299,7 +379,7 @@ class PointCapsNet(nn.Module):
         super(PointCapsNet, self).__init__()
         self.conv_layer = ConvLayer()
         self.primary_point_caps_layer = PrimaryPointCapsLayer(prim_vec_size, num_points)
-        self.latent_caps_layer = LatentCapsLayer(latent_caps_size, prim_caps_size, prim_vec_size, latent_vec_size)
+        self.latent_caps_layer = ConvCaps(B=prim_caps_size,C=latent_caps_size,P=4,stride=1,K=1)
         self.caps_decoder = CapsDecoder(latent_caps_size,latent_vec_size, num_points)
 
     def forward(self, data):
@@ -335,7 +415,7 @@ if __name__ == '__main__':
     prim_caps_size=1024
     prim_vec_size=16
 
-    latent_caps_size=32
+    latent_caps_size=64
     latent_vec_size=16
 
     num_points=2048
@@ -356,3 +436,4 @@ if __name__ == '__main__':
     dist1, dist2 = distChamfer(rand_data_, reconstruction_)
     loss = (torch.mean(dist1)) + (torch.mean(dist2))
     print(loss.item())
+
