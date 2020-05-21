@@ -1,4 +1,7 @@
-
+# Our fork contributions
+### by Christopher Murray ([murrman95](https://github.com/murrman95)) and Guillaume Dufau ([GuillaumeDufau](https://github.com/GuillaumeDufau))
+-Implemented [Expectation Maximization Routing](https://www.cs.toronto.edu/~hinton/absps/EMcapsules.pdf) 
+-- see models/em_pointcapsnet_ae.py
 
 ## 3D Point Capsule Networks
 Created by <a href="http://campar.in.tum.de/Main/YongHengZhao" target="_blank">Yongheng Zhao</a>, <a href="http://campar.in.tum.de/Main/TolgaBirdal" target="_blank">Tolga Birdal</a>, <a href="http://campar.in.tum.de/Main/HaowenDeng" target="_blank">Haowen Deng</a>, <a href="http://campar.in.tum.de/Main/FedericoTombari" target="_blank">Federico Tombari </a> from TUM.
